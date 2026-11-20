@@ -64,15 +64,20 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import Adam
+from torchinfo import summary
 
 
 import numpy as np
 from collections import deque
 import random
-import csv, os, time, datetime
+import csv
+import os
+import sys
+import time
 from datetime import datetime
+import argparse
 import cv2
-from copy import deepcopy
+
 
 # -----------------------------
 # Imports for Gym Atari MsPacman
@@ -80,11 +85,8 @@ from copy import deepcopy
 import gymnasium as gym
 import ale_py
 from gymnasium.wrappers import FrameStackObservation
-# SLURM Commands:
-    # sbatch run_pacman.sbatch
-    # squeue -u mjserena
-    # sinfo
-timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
+
+timestamp = datetime.now().strftime("%Y%j_%H%M%S.%f")
 print(timestamp)
 print("Python:", os.sys.version)
 print("PyTorch:", torch.__version__)
@@ -95,7 +97,7 @@ if slurm_job_id:
     print(f"Slurm Job ID: {slurm_job_id}")
 else:
     print("SLURM_JOB_ID not set.")
-    
+
 print("Node:", os.environ.get("SLURMD_NODENAME"))
 print("Node list:", os.environ.get("SLURM_JOB_NODELIST"))
 print("Partition:", os.environ.get("SLURM_JOB_PARTITION"))
@@ -112,7 +114,34 @@ else:
     print('Hardware acceleration not available, using CPU')
     device = torch.device('cpu')
 
+num_episodes = 10000  # Default
 
+parser = argparse.ArgumentParser(description="Ms. Pac-Man DQN Training")
+
+parser.add_argument(
+    "--num_episodes",
+    type=int,
+    default=10000,
+    help="Number of training episodes (default: 10000)"
+)
+
+parser.add_argument(
+    "--experiment",
+    type=str,
+    default="baseline",
+    help="Experiment identifier (default: baseline)"
+)
+
+args = parser.parse_args()
+
+num_episodes = args.num_episodes
+experiment = args.experiment
+
+cnn_summary_file = f"cnn_summary_{experiment}.txt"
+log_file = f"log_pacman_{experiment}.csv"
+qnet_file = f"qnet_best_{experiment}.pt"
+
+print(f"Training for {num_episodes} episodes")
 
 class AtariPreprocess(gym.ObservationWrapper):
     def __init__(self, env, height=84, width=84):
@@ -305,12 +334,12 @@ class GymDQNAgent:
         # It tells the network: “If I nudge this weight up or down, how much would my loss change?”
         # Gradients are used for learning, because optimizers like Adam or SGD use them to update weights
         # So gradients are only needed when we are training (doing backpropagation).
-        
+
         # Do not track gradients for anything inside this block
         # During action selection: not updating weights.
         # Are only: running a forward pass, picking the max-Q action
         # Do not want PyTorch to compute gradients
-  
+
         with torch.no_grad():
             q_values = self.qnet(state)  
             action = q_values.argmax(dim=1).item()
@@ -325,25 +354,25 @@ class GymDQNAgent:
     def train_step(self):
         if len(self.memory) < self.batch_size:
             return None  # not enough samples
-    
+
         # 1. Sample batch — returns list of tuples
         batch = self.memory.sample(self.batch_size)
         states, actions, rewards, next_states, dones = zip(*batch)
-    
+
         # 2. Convert to numpy arrays
         states      = np.stack(states)        # shape (B, 4, 84, 84)
         next_states = np.stack(next_states)   # shape (B, 4, 84, 84)
         actions     = np.array(actions, dtype=np.int64)
         rewards     = np.array(rewards, dtype=np.float32)
         dones       = np.array(dones, dtype=np.float32)
-    
+
         # 3. Convert to tensors
         states      = torch.as_tensor(states, dtype=torch.float32, device=self.device)
         next_states = torch.as_tensor(next_states, dtype=torch.float32, device=self.device)
         actions     = torch.as_tensor(actions, dtype=torch.long, device=self.device).unsqueeze(1)
         rewards     = torch.as_tensor(rewards, dtype=torch.float32, device=self.device).unsqueeze(1)
         dones       = torch.as_tensor(dones, dtype=torch.float32, device=self.device).unsqueeze(1)
-    
+
         # 4. Q(s,a) using online network
         q_values = self.qnet(states)                  # (B, num_actions)
         q_sa = q_values.gather(1, actions)            # (B, 1)
@@ -362,12 +391,19 @@ class GymDQNAgent:
         # We quantify that error as loss. 
         loss = torch.nn.functional.mse_loss(q_sa, target)
     
-        # 7. Optimize
-        # The optimizer (Adam) then back-propagates that loss and 
-        # updates weights to make the network’s Q-value predictions 
-        # closer to the Bellman target.
+       # 7. Optimize
+        # Clear previous gradients.
+        # Backpropagate the loss to calculate gradients.
+        # Use the Adam optimizer to update the CNN weights,
+        # minimizing the difference between predicted Q-values
+        # and their Bellman targets
+
+        # Clears gradients from the previous training step
         self.optimizer.zero_grad()
+        # Computes gradients of the loss with respect to the network parameters
+        # using backpropagation
         loss.backward()
+        # Uses Adam to update the network weights
         self.optimizer.step()
     
         # 8. Update target network
@@ -434,7 +470,7 @@ model_stats = summary(
     depth=2,
     verbose=0
 )
-with open("cnn_baseline_summary.txt", "w") as f:
+with open(cnn_summary_file, "w") as f:
     f.write(str(model_stats))
 print(model_stats)
 
@@ -464,38 +500,37 @@ agent = GymDQNAgent(
     optimizer=optimizer,
 )
 
-num_episodes = 10000
 min_replay_size = 5000
 
 episode_returns = []
 episode_lengths = []
 episode_durations = []
 best_last100_avg = -float("inf")
-episode_losses = []
-log = "log_pacman.csv"
+
 # Set debugging off
 print_debugging = False
-timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
+
+timestamp = datetime.now().strftime("%Y%j_%H%M%S.%f")
 print(timestamp)
-# Open log file
-log_path = log    
-if log_path:
-    if os.path.exists(log_path):
-        pass
-    else:
-        with open(log_path, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                "timestamp", "phase", "episode", "return", 
-                "steps", "avg_loss","epsilon"
-            ])
-        print(log_path, "created")
+
+# Create log file and write header
+with open(log_file, "w", newline="") as f:
+    writer = csv.writer(f)
+    writer.writerow([
+        "timestamp", "phase", "episode", "return",
+        "steps", "loss", "epsilon"
+    ])
+
+print(log_file, "created")
 
 
 print("Running", num_episodes, "Training episodes")
 phase = "train"
 for episode in range(num_episodes):
     obs, info = train_env.reset()
+
+    total_loss = 0.0
+    loss_count = 0
 
     # obs is an LazyFrames shaped (4, 84, 84)
     state = np.array(obs, copy=False)  # you can normalize later in forward()
@@ -508,7 +543,7 @@ for episode in range(num_episodes):
     while not done:
 
         steps += 1
-        
+
         # 1. Select action
         state_tensor = torch.as_tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
         action = agent.select_action(state_tensor)
@@ -526,17 +561,17 @@ for episode in range(num_episodes):
         # 4. Train if we have enough data
         if len(memory) >= min_replay_size:
             # Save returned loss
-            loss_value = agent.train_step()   
+            loss_value = agent.train_step()
             # Store loss for monitoring
-            if loss_value is not None:        
-                episode_losses.append(loss_value)
-            
-    if len(episode_losses) > 0:
-        avg_loss = sum(episode_losses) / len(episode_losses)
-    else:
-        avg_loss = None
+            if loss_value is not None:
+                total_loss += loss_value
+                loss_count += 1
 
     ep_duration = time.time() - ep_start_time
+    if loss_count > 0:
+        episode_loss = total_loss / loss_count
+    else:
+        episode_loss = None
 
     # Save stats for summaries
     episode_returns.append(episode_return)
@@ -545,11 +580,11 @@ for episode in range(num_episodes):
     timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
     if print_debugging:
         print(
-            f"[{timestamp}] Episode {episode}, return: {episode_return}, steps: {steps}, avg_loss: {avg_loss}, epsilon: {agent.epsilon():.3f}"
+            f"[{timestamp}] Episode {episode}, return: {episode_return}, steps: {steps}, loss: {episode_loss}, epsilon: {agent.epsilon():.3f}"
     )
 
     # Append CSV row
-    with open(log_path, "a", newline="") as f:
+    with open(log_file, "a", newline="") as f:
         writer = csv.writer(f)
         writer.writerow([
             timestamp,
@@ -557,7 +592,7 @@ for episode in range(num_episodes):
             episode,
             episode_return,
             steps,
-            avg_loss,
+            episode_loss,
             agent.epsilon()])
 
     # Print summary every 100 episodes
@@ -572,7 +607,8 @@ for episode in range(num_episodes):
         avg_last_len = sum(last_lengths) / len(last_lengths)
         avg_last_time = sum(last_durations) / len(last_durations)
 
-        print("Reinforcement Learning Status:")
+        timestamp = datetime.now().strftime("%Y%j_%H%M%S.%f")
+        print(f"Reinforcement Learning Status at: {timestamp}")
         print(f"\tCompleted {episode + 1} training episodes")
         print(f"\tAverage Rewards over all training: {avg_all:.2f}")
         print(f"\tAverage Rewards for last {window} episodes: {avg_last_ret:.2f}")
@@ -583,7 +619,7 @@ for episode in range(num_episodes):
          # Save best-performing network so far
         if avg_last_ret > best_last100_avg:
             best_last100_avg = avg_last_ret
-            torch.save(qnet.state_dict(), "qnet_best.pt")
+            torch.save(qnet.state_dict(), qnet_file)
             print(f"qnet saved with best last-100 avg reward = {avg_last_ret:.2f}")
 
 
@@ -595,15 +631,22 @@ test_env = gym.make(
     "ALE/MsPacman-v5",
     frameskip=4,
     repeat_action_probability=0.25,  # <-- stochasticity ON
-    render_mode="human"
+    render_mode=None
 )
 
 test_env = AtariPreprocess(test_env)
 test_env = FrameStackObservation(test_env, stack_size=4)
+
 if torch.cuda.is_available():
-    device = "cuda"  
+    device = torch.device('cuda')
+    print (f'GPU is available, using { device }')
+elif torch.mps.is_available():
+    device = torch.device('mps')
+    print (f'Apple Metal Performance Shaders framework is available, using { device }')
 else:
-    device = "cpu"
+    device = torch.device('cpu')
+    print (f'Hardware acceleration not available , using { device }')
+print()
 
 qnet.to(device)
 
@@ -631,6 +674,8 @@ def run_test_episode(qnet, env, device):
         with torch.no_grad():
             q_values = qnet(state_tensor)
             action = q_values.argmax(dim=1).item()
+            if steps % 100 == 0:
+                print(f"Step {steps}: action={action}, Q-values={q_values.cpu().numpy().round(2)}")
 
         # Step the environment using the chosen action
         next_obs, reward, terminated, truncated, info = env.step(action)
@@ -646,19 +691,22 @@ def run_test_episode(qnet, env, device):
     print(f"[Testing] return: {episode_return}, steps: {steps}")
     return episode_return, steps
 
-if os.path.exists("qnet_best.pt"):
-    print("loading qnet_best.pt")
-    state_dict = torch.load("qnet_best.pt", map_location=device, weights_only=True)
+if os.path.exists(qnet_file):
+    print(f"loading {qnet_file}")
+    state_dict = torch.load(qnet_file, map_location=device, weights_only=True)
     qnet.load_state_dict(state_dict)
 
 
-num_episodes = 100
 phase = "test"
-print("Running", num_episodes, "Testing episodes")
-for episode in range(num_episodes):
+# For testing, run 1% of training episodes, with a minimum of 10
+num_test_episodes = max(10, round(num_episodes * 0.01))
+
+print(f"Running {num_test_episodes} testing episodes")
+
+for episode in range(num_test_episodes):
     episode_return, steps = run_test_episode(qnet, test_env, device)
     # Append CSV row
-    with open(log_path, "a", newline="") as f:
+    with open(log_file, "a", newline="") as f:
         writer = csv.writer(f)
         writer.writerow([
             timestamp,
